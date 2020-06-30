@@ -1,0 +1,225 @@
+---
+output:
+  github_document:
+    toc: true
+    toc_depth: 1
+    pandoc_args: --webtex
+---
+
+```{r packages, include=FALSE}
+library(tidyverse)
+library(quantreg)
+library(lubridate)
+library(ggpubr)
+source("../src/exact_prob_functions.r")
+```
+
+## Purpose
+Similar to the `deterministic_flows` notebook, we produce the exact probability distributions of flow n time steps into the future. However this time, when splitting the train/test set, we pick a day a few steps prior to a flooding event. This is to demonstrate that the model is unable to accurately predict events outside of a one time-step range. As the functions used are the same, we just import them to reduce volume. 
+
+
+## Data Cleaning
+
+In the cell below, we are loading the dataset, selecting our gauge of interest, splitting data into training and testing sets.
+
+```{r}
+# User Specificed Data
+gauge <- '05DF008_flow_m3s-1'
+train_test_ratio <- 0.799
+
+
+# Reading data file and selecting desired guage/cleaning
+# Make sure that the names of the columns match
+river_flow <- read_csv("../data/station_flowrate_R.csv",
+                       col_types = cols(.default = "d", time = "D")) %>% 
+  select('time', gauge) %>% 
+  drop_na() %>% 
+  rename('date' = time, 'flow' = gauge) %>% 
+  filter(leap_year(date) == FALSE) %>% 
+  filter(flow != 0) %>% 
+  mutate(Year = year(date), Day = yday(date)) %>%
+  select(Year, Day, flow)
+
+# Train and test data split
+train_data <- river_flow[1:ceiling(length(river_flow$flow)*train_test_ratio), ]
+test_data <- river_flow[-(1:ceiling(length(river_flow$flow)*train_test_ratio)), ]
+```
+
+
+## Modelling
+
+Here we create the quantile regression model that will be used for predicting future data.
+
+```{r creating baseline model}
+# User specified info for loess function
+my_span <- 0.1
+my_tau <- seq(from = 2, to =98 , by = 2)/100
+
+
+# Training initial model
+qr_data <- data.frame('flow' = train_data$flow,
+                      'lag1' = lag(train_data$flow, n = 1),
+                      'lag2' = lag(train_data$flow, n = 2),
+                      'lag3' = lag(train_data$flow, n = 3))
+
+my_model <- rq(flow ~ lag1 + lag2 + lag3, tau = my_tau, data = qr_data)
+
+```
+
+
+Here we will predict the distributions of flows for any number of given days ahead. Note that the computational difficulty increases exponentially as the number of days we are trying to predict approaches the maximum number of lags of the model. After that, since the input data set has already reached maximum size, computation time will scale linearly with the number of days.
+
+
+
+``` {r predicting n days ahead}
+# User specified info for prediction
+current_day <- 0
+days_forward <- 6
+input_data <- data.frame()
+sample_storage <- data.frame(matrix(ncol=days_forward, nrow=(length(my_tau) + 1)))
+colnames(sample_storage) <- c(1:days_forward)
+resolution <- length(my_tau) + 1
+
+
+# Prediction
+while (days_forward > 0) {
+  # This is only triggered on the first iteration, as input_data is not yet initialized
+  if (length(input_data) == 0) {
+    
+    # Taking the last day of the train set as continuation
+    input_sample <- data.frame('lag1' = tail(qr_data$flow, n = 1),
+                               'lag2' = tail(qr_data$lag1, n = 1),
+                               'lag3' = tail(qr_data$lag2, n = 1))
+    
+    # Quantile prediction
+    quantile_predictions <- predict(my_model, newdata = input_sample)
+    # Conversion to points
+    my_points <- quantiles_to_points(quantile_predictions)
+    # Updating day
+    current_day <- current_day + 1
+    # Adding the final sample points
+    sample_storage[, current_day] <- my_points
+    # Updating remaining number of days needed to predict
+    days_forward <- days_forward - 1
+    # Creating the input data sets
+    input_data <- create_input_data(current_day = current_day,
+                                    resolution = resolution,
+                                    max_lags = 3,
+                                    input_data = input_sample,
+                                    sample_storage = sample_storage)
+    # How many times we need to iterate
+    n_iter <- nrow(input_data)
+    # Temporary storage for the all the sample points generated from the new input sets
+    temp_data <- vector('double', resolution*nrow(input_data))
+  
+  # This is triggered as we iterate through the input sets
+  } else if (n_iter > 0) {
+    
+    input_sample <- input_data[n_iter, ]
+    
+    #attempt(predict(my_model, newdata = input_sample), msg = n_iter)
+    quantile_predictions <- predict(my_model, newdata = input_sample)
+    
+    my_points <- quantiles_to_points(quantile_predictions)
+    # Adding the points to temporary storage
+    temp_data[((n_iter-1)*length(my_points) + 1):(n_iter*length(my_points))] <- my_points
+    n_iter <- n_iter - 1
+  
+  # This is triggered when we are finished all iterations for a given day  
+  } else if (n_iter == 0) {
+    
+    current_day <- current_day + 1
+    # Adding the final sample points after condensing
+    sample_storage[, current_day] <- condense_points(temp_data = temp_data,
+                                                     resolution = resolution)
+    days_forward <- days_forward - 1
+    
+    if (days_forward > 0) {
+      
+      
+      input_data <- create_input_data(current_day = current_day,
+                                      resolution = resolution,
+                                      max_lags = 3,
+                                      input_data = input_data,
+                                      sample_storage = sample_storage)
+      
+      n_iter <- nrow(input_data)
+      print(paste('The number of test set iterations for step', current_day, 'is', n_iter, sep = ' '))
+      temp_data <- vector('double', resolution*nrow(input_data))
+    }
+  }
+}
+```
+
+Cleaning results for presentation
+
+```{r Beautify results}
+final_storage <- data.frame(sample_storage)
+
+for (n in 1:ncol(final_storage)) {
+  colnames(final_storage)[n] <- paste('Day', n, sep = ' ')
+}
+
+final_storage
+
+```
+
+Here are the actual flows, with the first row corresponding to `Day 1` ...etc.
+
+```{r actual results}
+head(test_data)
+```
+
+# Visualization
+
+Here we will plot the density for each day to obtain the probability distribution for each day. I have not automated the plotting aspect.
+
+```{r Viz, fig.height = 15, fig.width = 10}
+
+plot1 <- ggplot(data = final_storage) +
+  geom_density(aes(`Day 1`)) +
+  geom_vline(xintercept = test_data$flow[1], color = 'red', size = 1) +
+  ggtitle('Day 1 PDF (Actual in Red)') +
+  xlim(min(final_storage), test_data$flow[3]) +
+  theme(axis.title.x = element_blank())
+
+plot2 <- ggplot(data = final_storage) +
+  geom_density(aes(`Day 2`)) +
+  geom_vline(xintercept = test_data$flow[2], color = 'red', size = 1) +
+  ggtitle('Day 2 PDF (Actual in Red)') +
+  xlim(min(final_storage), test_data$flow[3]) +
+  theme(axis.title.x = element_blank())
+
+plot3 <- ggplot(data = final_storage) +
+  geom_density(aes(`Day 3`)) +
+  geom_vline(xintercept = test_data$flow[3], color = 'red', size = 1) +
+  ggtitle('Day 3 PDF (Actual in Red)') +
+  xlim(min(final_storage), test_data$flow[3]) +
+  theme(axis.title.x = element_blank())
+
+plot4 <- ggplot(data = final_storage) +
+  geom_density(aes(`Day 4`)) +
+  geom_vline(xintercept = test_data$flow[4], color = 'red', size = 1) +
+  ggtitle('Day 4 PDF (Actual in Red)') +
+  xlim(min(final_storage), test_data$flow[3]) +
+  theme(axis.title.x = element_blank())
+
+plot5 <- ggplot(data = final_storage) +
+  geom_density(aes(`Day 5`)) +
+  geom_vline(xintercept = test_data$flow[5], color = 'red', size = 1) +
+  ggtitle('Day 5 PDF (Actual in Red)') +
+  xlim(min(final_storage), test_data$flow[3]) +
+  theme(axis.title.x = element_blank())
+
+plot6 <- ggplot(data = final_storage) +
+  geom_density(aes(`Day 6`)) +
+  geom_vline(xintercept = test_data$flow[6], color = 'red', size = 1) +
+  ggtitle('Day 6 PDF (Actual in Red)') +
+  xlim(min(final_storage), test_data$flow[3]) +
+  xlab('Flow (m^3/s)')
+
+ggarrange(plot1, plot2, plot3, plot4, plot5, plot6, ncol = 1)
+
+```
+
+
